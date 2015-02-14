@@ -9,30 +9,26 @@ import static edu.cornell.mannlib.vitro.webapp.modules.searchIndexer.SearchIndex
 import java.io.ByteArrayInputStream;
 import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+import com.hp.hpl.jena.graph.Node;
+import com.hp.hpl.jena.graph.Triple;
+import com.hp.hpl.jena.rdf.model.*;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-
-import com.hp.hpl.jena.rdf.model.Literal;
-import com.hp.hpl.jena.rdf.model.Model;
-import com.hp.hpl.jena.rdf.model.ModelFactory;
-import com.hp.hpl.jena.rdf.model.Property;
-import com.hp.hpl.jena.rdf.model.RDFNode;
-import com.hp.hpl.jena.rdf.model.Resource;
-import com.hp.hpl.jena.rdf.model.ResourceFactory;
-import com.hp.hpl.jena.rdf.model.Statement;
-import com.hp.hpl.jena.rdf.model.StmtIterator;
 
 import edu.cornell.mannlib.vitro.webapp.dao.jena.event.EditEvent;
 import edu.cornell.mannlib.vitro.webapp.modules.searchIndexer.SearchIndexer;
 import edu.cornell.mannlib.vitro.webapp.modules.searchIndexer.SearchIndexer.Event;
 import edu.cornell.mannlib.vitro.webapp.rdfservice.ChangeListener;
 import edu.cornell.mannlib.vitro.webapp.utils.threads.VitroBackgroundThread;
+import org.apache.jena.riot.RDFLanguages;
+import org.apache.jena.riot.RiotReader;
 
 /**
  * When a change is heard, wait for an interval to see if more changes come in.
@@ -44,19 +40,6 @@ import edu.cornell.mannlib.vitro.webapp.utils.threads.VitroBackgroundThread;
  * 
  * If the SearchIndexer begins a rebuild, discard any changes that we had
  * accumulated. They will be accomplished by the rebuild.
- * 
- * -----------------------
- * 
- * When a changed statement is received, it should not be added to the list of
- * pending changes. The elements of the statement hold references to the model
- * in which they were created, as well as to other structures.
- * 
- * Thus, an action that produces many changes to the models could become
- * unscalable.
- * 
- * To avoid this, we use the ResourceFactory to create a "sanitized" statement
- * which is semantically equivalent to the original, and add that to the list
- * instead. The original statement is released.
  */
 public class IndexingChangeListener implements ChangeListener,
 		SearchIndexer.Listener {
@@ -65,6 +48,7 @@ public class IndexingChangeListener implements ChangeListener,
 
 	private final SearchIndexer searchIndexer;
 	private final Ticker ticker;
+    private final Model defaultModel;
 	private volatile boolean paused = true;
 
 	/** All access to the list must be synchronized. */
@@ -73,57 +57,17 @@ public class IndexingChangeListener implements ChangeListener,
 	public IndexingChangeListener(SearchIndexer searchIndexer) {
 		this.searchIndexer = searchIndexer;
 		this.ticker = new Ticker();
+        this.defaultModel = ModelFactory.createDefaultModel();
 		this.changes = new ArrayList<>();
 
 		searchIndexer.addListener(this);
 	}
 
 	private synchronized void noteChange(Statement stmt) {
-		try {
-			changes.add(sanitize(stmt));
-			if (!paused) {
-				ticker.start();
-			}
-		} catch (Exception e) {
-			log.warn("Failed to sanitize this statement: " + stmt);
-		}
-	}
-
-	private Statement sanitize(Statement rawStmt) {
-		return ResourceFactory.createStatement(
-				sanitizeSubject(rawStmt.getSubject()),
-				sanitizePredicate(rawStmt.getPredicate()),
-				sanitizeObject(rawStmt.getObject()));
-	}
-
-	private Resource sanitizeSubject(Resource rawSubject) {
-		if (rawSubject.isURIResource()) {
-			return ResourceFactory.createResource(rawSubject.getURI());
-		}
-		return ResourceFactory.createResource();
-	}
-
-	private Property sanitizePredicate(Property rawPredicate) {
-		return ResourceFactory.createProperty(rawPredicate.getURI());
-	}
-
-	private RDFNode sanitizeObject(RDFNode rawObject) {
-		if (rawObject.isURIResource()) {
-			return ResourceFactory.createResource(rawObject.asResource()
-					.getURI());
-		}
-		if (rawObject.isResource()) {
-			return ResourceFactory.createResource();
-		}
-		Literal l = rawObject.asLiteral();
-		if (StringUtils.isNotEmpty(l.getLanguage())) {
-			return ResourceFactory.createLangLiteral(l.getString(),
-					l.getLanguage());
-		}
-		if (null != l.getDatatype()) {
-			return ResourceFactory.createTypedLiteral(l.getValue());
-		}
-		return ResourceFactory.createPlainLiteral(l.getString());
+        changes.add(stmt);
+        if (!paused) {
+            ticker.start();
+        }
 	}
 
 	@Override
@@ -180,30 +124,62 @@ public class IndexingChangeListener implements ChangeListener,
 		}
 	}
 
-	// TODO avoid overhead of Model.
 	// TODO avoid duplication with JenaChangeListener
 	private Statement parseTriple(String serializedTriple) {
-		try {
-			Model m = ModelFactory.createDefaultModel();
-			m.read(new ByteArrayInputStream(serializedTriple.getBytes("UTF-8")),
-					null, "N3");
-			StmtIterator sit = m.listStatements();
-			if (!sit.hasNext()) {
-				throw new RuntimeException("no triple parsed from change event");
-			} else {
-				Statement s = sit.nextStatement();
-				if (sit.hasNext()) {
-					log.warn("More than one triple parsed from change event");
-				}
-				return s;
-			}
-		} catch (RuntimeException riot) {
-			log.error("Failed to parse triple " + serializedTriple, riot);
-			throw riot;
-		} catch (UnsupportedEncodingException uee) {
-			throw new RuntimeException(uee);
-		}
+        try {
+            Iterator<Triple> it = RiotReader.createIteratorTriples(new ByteArrayInputStream(serializedTriple.getBytes("UTF-8")), RDFLanguages.NTRIPLES, null);
+
+            if (it.hasNext()) {
+                Triple triple = it.next();
+
+                if (it.hasNext()) {
+                    log.warn("More than one triple parsed from change event");
+                }
+
+                // Converts the Triple into a Statement, without attaching it to the Model
+                return defaultModel.asStatement(triple);
+
+/*
+                -- Alternative way to create a statement, without using a Model
+                return ResourceFactory.createStatement(
+                        ResourceFactory.createResource(triple.getSubject().getURI()),
+                        ResourceFactory.createProperty(triple.getPredicate().getURI()),
+                        makeObject(triple.getObject()));
+*/
+            } else {
+                throw new RuntimeException("no triple parsed from change event");
+            }
+        } catch (RuntimeException riot) {
+            log.error("Failed to parse triple " + serializedTriple, riot);
+            throw riot;
+        } catch (UnsupportedEncodingException uee) {
+            throw new RuntimeException(uee);
+        }
 	}
+
+    /**
+     * If not using Model.asStatement, this helper method is required to convert a Triple to a Statement
+     */
+    /*
+    private RDFNode makeObject(Node object) {
+        if (object.isURI()) {
+            return ResourceFactory.createResource(object.getURI());
+        }
+        if (object.isLiteral()) {
+            if (StringUtils.isNotEmpty(object.getLiteralLanguage())) {
+                return ResourceFactory.createLangLiteral(object.getLiteralValue().toString(), object.getLiteralLanguage());
+            }
+
+            if (null != object.getLiteralDatatype()) {
+                return ResourceFactory.createTypedLiteral(object.getLiteralValue());
+            }
+
+            return ResourceFactory.createPlainLiteral(object.getLiteralValue().toString());
+        }
+
+        return ResourceFactory.createResource();
+    }
+    */
 
 	// ----------------------------------------------------------------------
 	// helper classes
